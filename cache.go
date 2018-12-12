@@ -1,38 +1,40 @@
 package iCache
 
 import (
-	"errors"
-	"sync"
-	"os"
 	"encoding/gob"
-	"time"
+	"errors"
 	"log"
+	"os"
 	"reflect"
+	"sync"
+	"time"
 )
 
 type entries map[uint64]*entry
+type expiredDates map[uint64]int64
 
 type entry struct {
-	rw        sync.RWMutex
 	Data      reflect.Value
 	ExpiresAt int64
 	Ttl       int64
 }
 
 type Pot struct {
-	rw        sync.RWMutex
-	Entries   entries
-	path      string
-	flushTime int64
-	flushLen  float64
-	inited    bool
+	entriesLock      sync.RWMutex
+	Entries          entries
+	ExpiredDates     expiredDates
+	expiredDatesLock sync.RWMutex
+	path             string
+	flushTime        int64
+	flushLen         float64
+	inited           bool
 }
 
 var now int64
 
 func NewDiskPot(path string) (Cache *Pot, err error) {
 	Cache = new(Pot)
-	Cache.Entries = entries{}
+	Cache.Init()
 	Cache.path = path
 	if file, err := os.Open(path); err == nil {
 		decoder := gob.NewDecoder(file)
@@ -57,45 +59,67 @@ func NewDiskPot(path string) (Cache *Pot, err error) {
 
 func NewPot() (Cache *Pot) {
 	Cache = new(Pot)
-	Cache.Purge()
+	Cache.Init()
 	return
 }
 
+func (c *Pot) Init() {
+	c.Purge()
+	go func() {
+		for {
+			c.deleteAllExpired()
+			time.Sleep(time.Second)
+		}
+	}()
+}
+
 func (c *Pot) Purge() {
-	c.rw.Lock()
+	c.entriesLock.Lock()
 	c.Entries = entries{}
+	c.entriesLock.Unlock()
+
+	c.expiredDatesLock.Lock()
+	c.ExpiredDates = expiredDates{}
+	c.expiredDatesLock.Unlock()
+
 	c.inited = true
-	c.rw.Unlock()
-	return
 }
 
 func (c *Pot) panicIfNotInitialized() {
 	if ! c.inited {
 		panic("iCache should be initialized before use")
 	}
-	return
 }
 
 func (c *Pot) Len() (l float64) {
-
-	c.rw.Lock()
+	c.entriesLock.Lock()
 	l = float64(len(c.Entries))
-	c.rw.Unlock()
+	c.entriesLock.Unlock()
 	return l
 }
 
 func (c *Pot) Drop(key string) {
 	k := keyGen(key)
-	c.rw.Lock()
+	c.entriesLock.Lock()
 	c.Entries[k] = nil
 	delete(c.Entries, k)
-	c.rw.Unlock()
+	c.entriesLock.Unlock()
+}
+
+func (c *Pot) dropByUint64(k uint64) {
+	c.entriesLock.Lock()
+	c.expiredDatesLock.Lock()
+	c.Entries[k] = nil
+	delete(c.Entries, k)
+	delete(c.ExpiredDates, k)
+	c.expiredDatesLock.Unlock()
+	c.entriesLock.Unlock()
 }
 
 func (c *Pot) Exists(key string) bool {
-	c.rw.Lock()
+	c.entriesLock.Lock()
 	_, ok := c.Entries[keyGen(key)]
-	c.rw.Unlock()
+	c.entriesLock.Unlock()
 	return ok
 }
 
@@ -104,11 +128,11 @@ func (c *Pot) Flush() (err error, took time.Duration) {
 		return errors.New("disk cache is not enabled"), 0
 	}
 	st := time.Now()
-	c.rw.Lock()
+	c.entriesLock.Lock()
 	c.flushTime = now
 	c.flushLen = float64(len(c.Entries))
 	temp := *c
-	c.rw.Unlock()
+	c.entriesLock.Unlock()
 	file, err := os.Create(temp.path)
 	if err == nil {
 		encoder := gob.NewEncoder(file)
@@ -125,40 +149,60 @@ func (c *Pot) Get(key string, i interface{}) (err error) {
 		return errors.New("need to be a pointer")
 	}
 	k := keyGen(key)
-	c.rw.Lock()
+	c.entriesLock.Lock()
 	ent, ok := c.Entries[k]
-	c.rw.Unlock()
+	c.entriesLock.Unlock()
 
 	if ! ok {
 		return errors.New("not found")
 	}
 	if ent.Ttl > 0 {
 		if now > ent.ExpiresAt {
-			c.rw.Lock()
-			c.Entries[k] = nil
-			delete(c.Entries, k)
-			c.rw.Unlock()
+			c.dropByUint64(k)
 			return errors.New("expired")
 		}
 		// ent.ExpiresAt = time.Now().Unix() + ent.Ttl
 	}
 	v.Elem().Set(ent.Data)
+
 	return nil
 }
 
 func (c *Pot) Set(k string, i interface{}, ttl time.Duration) {
+	ExpiresAt := time.Now().Add(ttl).Unix()
 	var v reflect.Value
 	if reflect.TypeOf(i).Kind() == reflect.Ptr {
 		v = reflect.ValueOf(i).Elem()
 	} else {
 		v = reflect.ValueOf(i)
 	}
-	c.rw.Lock()
+	c.entriesLock.Lock()
 	c.Entries[keyGen(k)] = &entry{
 		Data:      v,
 		ExpiresAt: time.Now().Add(ttl).Unix(),
 	}
-	c.rw.Unlock()
+	if ttl > 0 {
+		c.expiredDatesLock.Lock()
+		c.ExpiredDates[keyGen(k)] = ExpiresAt
+		c.expiredDatesLock.Unlock()
+	}
+	c.entriesLock.Unlock()
+}
+
+func (c *Pot) deleteAllExpired() {
+	var expired []uint64
+	for k, expiresAt := range c.ExpiredDates {
+		if now > expiresAt {
+			expired = append(expired, k)
+		}
+	}
+	c.entriesLock.Lock()
+	for _, k := range expired {
+		c.Entries[k] = nil
+		delete(c.ExpiredDates, k)
+		delete(c.Entries, k)
+	}
+	c.entriesLock.Unlock()
 }
 
 func init() {
